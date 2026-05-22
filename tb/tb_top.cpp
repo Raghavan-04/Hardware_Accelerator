@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
 
     // 2. Data Burst: Feeding 5 pairs of numbers into the FIFOs
     // Calculation: (10*2) + (20*3) + (30*4) + (40*5) + (50*6) = 20 + 60 + 120 + 200 + 300 = 700
-    int a_vals[] = {10, 20, 30, 40, 50};
+    int a_vals[] = {5, 15, 25, 35, 45};
     int b_vals[] = {2, 3, 4, 5, 6};
 
     std::cout << "--- Sending Data Burst to FIFOs ---" << std::endl;
