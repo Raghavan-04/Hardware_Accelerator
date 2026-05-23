@@ -281,3 +281,143 @@ all working at the exact same time.
 **The real mind-blower:** Tensor Core does **112 math operations** in the **same time** SDOT does **7**. That's **16× more work per clock cycle**.
 
 That's why AI models run on GPUs, not phones (unless the phone has a special NPU/AI chip doing the same trick).
+
+
+---
+
+## 🏗️ What Each Module Does
+
+### 1. `mac_unit.sv` (The Execution Engine)
+
+This is the low-level calculation block. It is a **hybrid bit-width computing cell** that acts as an individual lane's processing core.
+
+* **What it does:** It takes two 8-bit signed numbers (an activation and a weight), multiplies them together to get a 16-bit intermediate result, and then adds that result into a deeper 32-bit register.
+* **Key Feature:** It includes digital **saturation logic**. If a long calculation loop attempts to push the total beyond the limits of a 32-bit signed integer, the hardware automatically snaps and locks the value to its maximum positive (`32'h7FFFFFFF`) or negative (`32'h80000000`) boundary instead of wrapping around into corrupt data.
+
+### 2. `top_accelerator.sv` (The Orchestrator & Vector Wrapper)
+
+This is the top-level structural manager that ties your hardware blocks together into a single, high-performance IP core.
+
+* **What it does:** It exposes a standard 32-bit input interface to the outside world, which carries 4 packed INT8 elements. It splits this wide bus apart, routes each piece into independent lane queues, runs them simultaneously through **4 parallel instances of `mac_unit**`, and bundles the results into a wide 128-bit output bus.
+* **Key Feature:** It manages **dynamic backpressure and stall logic**. It checks the status flags of all internal lane buffers; if any buffer fills up, it drops its `r_ready` flag to signal the upstream data source to pause.
+
+### 3. `sync_fifo.sv` (The Data Buffer)
+
+This is the storage unit that sits at the entrance of every computing lane.
+
+* **What it does:** It acts as an elastic safety net. It buffers incoming operand data streams so that if the compute core is busy or temporarily stalled, incoming data can be safely held in memory registers without being dropped or causing timing hazards.
+
+### 4. `tb_top.cpp` (The Digital Scoreboard & Judge)
+
+This is your advanced C++ verification engine compiled via Verilator.
+
+* **What it does:** It creates a **dual-path co-simulation framework**. It generates thousands of constrained-random numbers and passes them to both a clean C++ mathematical model and your compiled SystemVerilog hardware simultaneously. It automatically shifts data down a virtual timeline to compensate for the hardware's 2-cycle pipeline latency, cross-checking every single bit to guarantee perfect behavioral alignment.
+
+---
+
+## 🔄 The Differences: Previous vs. Current Accelerator
+
+| Feature | Your Previous Accelerator Layout | The New SIMD Accelerator Layout |
+| --- | --- | --- |
+| **Compute Class** | **Scalar:** Processes 1 mathematical calculation per clock cycle. | **Vector (SIMD):** Processes **4 independent calculations** in parallel per clock cycle. |
+| **Bit-Width Design** | **Uniform:** Uses 16-bit widths for both inputs and 32-bit for the final output. | **Hybrid (Industry Standard):** Uses **INT8 inputs** for data streaming and **INT32 accumulation** for calculation safety. |
+| **Bus Efficiency** | **Low:** Needs wide, non-standard bus configurations to pass multiple values. | **High:** Packs 4 elements into a standard **32-bit data stream** ($4 \times 8\text{-bit}$), maximizing transfer efficiency. |
+| **Flow Control** | **Static:** Assumes upstream and downstream systems move in perfect lockstep. | **Dynamic:** Uses active **Valid/Ready handshaking** and pipeline bubble controls to handle data stalls. |
+| **Verification Strategy** | **Directed Check:** Relies on manual waveform inspection to verify basic numbers. | **Co-Simulation:** Uses an automated **C++ reference model scoreboard** to execute randomized stress regressions. |
+
+---
+
+## 💡 The Microarchitectural Summary
+
+In short: your previous accelerator was a single, isolated execution block that calculated math linearly.
+
+This new version is a **fully managed parallel processing subsystem**. It handles data formatting exactly like an industrial **ARM Neon Vector Engine** or an **NVIDIA Tensor Core** primitive by utilizing an INT8/INT32 split data path. It also protects data transactions with structural hardware handshakes, and validates its calculations using an automated verification framework.
+
+
+---
+
+Let’s deep-dive into the microarchitecture of your **INT8/INT32 Hybrid MAC (Multiply-Accumulate) Unit**.
+
+In high-performance computing, the MAC unit is the ultimate workhorse. Because matrix-matrix multiplication (which powers everything from audio filtering algorithms to deep learning neural networks) boils down to a massive loop of multiplying pairs of numbers and adding them to a running total, optimizing this single block is the most critical task for a digital IC designer.
+
+---
+
+# MAC UNIT
+
+Your `mac_unit.sv` is structured as a **synchronous 2-stage execution pipeline**. Instead of trying to perform a multiplication and an addition all within a single clock cycle, we split the math across a flip-flop boundary.
+
+```text
+               IN_WIDTH (8-bit)        IN_WIDTH (8-bit)
+                   a_in                    b_in
+                     │                       │
+                     ▼                       ▼
+               ┌──────────────────────────────────────┐
+               │         Signed Multiplier            │
+               └──────────────────┬───────────────────┘
+                                  │ (16-bit Product)
+                                  ▼
+                        [ en ] ──► █  mult_reg (Stage 1 Register)
+                                  │
+                                  ▼ (Sign-Extended to 32-bit)
+                                  │
+         ┌────────────────────────┴────────► ( + ) ◄────────┐
+         │                                    │             │
+         │                                    ▼             │
+         │                         ┌──────────────────┐     │
+         │                         │ Saturation Logic │     │
+         │                         └──────────┬───────└     │
+         │                                    │             │
+         │                                    ▼             │
+ [ clr ]─┼────────────────────────► [ MUX ] ──┼             │
+         │                             │      │             │
+         │                   (If clr=1)▼      ▼             │
+         │                            '0'    next_acc       │
+         │                                    │             │
+         │                                    ▼             │
+         └───────────────────────► [ en ] ──► █  acc_reg (Stage 2 Register)
+                                              │
+                                              ├─────────────┘
+                                              ▼
+                                         out (32-bit Output)
+
+```
+
+### Stage 1: The Combinatorial Multiply (`mult_reg`)
+
+* **The Operation:** On every clock edge where `en` (enable) is high, the circuit takes the 8-bit signed input `a_in` and multiplies it by the 8-bit signed input `b_in`.
+* **The Math:** Multiplying two 8-bit signed numbers yields a **16-bit signed product** ($8\text{-bit} \times 8\text{-bit} = 16\text{-bit}$).
+* **The Silicon Impact:** This 16-bit intermediate result is safely captured into `mult_reg` at the end of the first clock cycle.
+
+### Stage 2: Sign Extension & Saturated Accumulation (`acc_reg`)
+
+* **Sign Extension:** Before adding a 16-bit number to a 32-bit register, the hardware must perform **sign extension**. The line `signed'(mult_reg)` tells the synthesizer to copy the sign bit (bit 15) of the product into the upper 16 bits of a temporary 32-bit vector, ensuring that negative products stay mathematically negative in a 32-bit world.
+* **Accumulation:** The sign-extended product is added to the current value of the 32-bit accumulator register (`acc_reg`).
+* **The Silicon Impact:** This running total is updated inside `acc_reg` at the end of the second clock cycle.
+
+---
+
+## ⚡ Why Pipelining is a "Must" for Your Resume
+
+If you didn't pipeline this unit—meaning you tried to route `a_in` and `b_in` through the multiplier, straight into the adder, and into a register all in one cycle—you would create a massive **Critical Path** (the longest delay path from any register output to a register input).
+
+Multipliers are heavy, deep networks of combinatorial logic gates. By inserting `mult_reg` right after the multiplication step, you slice that critical path perfectly in half. This architectural decision allows your entire chip to run at a significantly higher **Maximum Frequency ($F_{max}$)**, which is the exact physical design metric corporate hiring managers check for.
+
+---
+
+## 🛡️ The Overflow Safeguard: Saturation Logic
+
+In standard desktop software programming, if a signed integer gets too large, it experiences a glitch called **integer wrap-around** (e.g., adding `1` to the maximum positive number suddenly turns it into a giant negative number). In real silicon audio or AI engines, a wrap-around glitch creates catastrophic noise spikes or broken calculations.
+
+Your MAC unit solves this using an industrial hardware technique called **Saturation Logic**. Inside the combinatorial `always_comb` block, it monitors the sign bits of the operands before allowing them into the register:
+
+1. **Positive Overflow Check:** If your current total (`acc_reg`) is positive, and the incoming product (`mult_reg`) is positive, the result *must* be positive. If the adder computes a negative result, the hardware knows an overflow occurred. It intercepts the data and snaps `next_acc` to the maximum legal positive value: `32'h7FFFFFFF` ($+2,147,483,647$).
+2. **Negative Overflow Check:** Conversely, if a negative total adds to a negative product and results in a positive number, the hardware snaps the data to the maximum legal negative boundary: `32'h80000000` ($-2,147,483,648$).
+
+---
+
+## 🎛️ Control Path Pins: `en` and `clr`
+
+To make this MAC unit work smoothly within your 4-lane SIMD cluster, it features two critical control lines:
+
+* **The `en` (Clock Enable) Pin:** This is your stall mechanism. When the downstream system is busy or a FIFO runs dry, `en` drops to `0`. This forces both `mult_reg` and `acc_reg` to ignore the clock edge and hold their exact current bits. Your data is frozen perfectly in time without losing a single calculation state.
+* **The `clr` (Synchronous Clear) Pin:** This is your flush mechanism. When starting a fresh dot-product vector calculation, the host processor asserts `clr` high for a single cycle. This bypasses the adder logic and injects absolute zeros straight into the `acc_reg` input multiplexer, wiping the slate clean for the next data batch.
