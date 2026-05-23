@@ -108,6 +108,5 @@ make clean && make
 
 To visually audit the hardware trace signals yourself, load the exported data directly inside GTKWave:
 
-```bash
-make view
+```
 
