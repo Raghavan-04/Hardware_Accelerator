@@ -118,13 +118,13 @@ Rather than relying on manual waveform inspection, this IP core is signed off vi
   ↳ Lane 3 -> Expected:       -31004 | RTL Read:       -31004  MATCH
 [Cycle  3] Checking SIMD Lanes: 
   ↳ Lane 0 -> Expected:         3122 | RTL Read:         3122  MATCH
-  ↳ Lane 1 -> Expected:        -1980 | RTL Read:        -1980 ✅ MATCH
+  ↳ Lane 1 -> Expected:        -1980 | RTL Read:        -1980  MATCH
   ↳ Lane 2 -> Expected:   2147483647 | RTL Read:   2147483647 ✅ MATCH [Saturation Locked]
   ↳ Lane 3 -> Expected:       -45812 | RTL Read:       -45812 ✅ MATCH
-...
 
 
 
+```
 
 #### Mathematical Proof of Correctness:
 
